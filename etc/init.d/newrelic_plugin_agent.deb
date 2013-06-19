@@ -108,7 +108,10 @@ if [ -z "${pidfile}" ]; then
   pidarg=" -p ${pidfile}"
 fi
 
-nrdaemonopts="-c ${cfgfile}${pidarg}"
+# The pid file is specified in the config file and can't be set on the
+# command line at the moment
+#nrdaemonopts="-c ${cfgfile}${pidarg}"
+nrdaemonopts="-c ${cfgfile}"
 
 #
 # Time to wait for the daemon to die, in seconds. If you set this too low the
@@ -124,7 +127,8 @@ running_pid()
   name=$2
   [ -z "$pid" ] && return 1
   [ ! -d /proc/$pid ] && return 1
-  cmd=`cat /proc/$pid/cmdline | tr "\000" "\n"|head -n 1 |cut -d : -f 1`
+  # Python is the first name, so we look at the second name
+  cmd=`cat /proc/$pid/cmdline | tr "\000" "\n" | head -n 2 | tail -n 1 | cut -d : -f 1`
   # Is this the expected child?
   [ "$cmd" = "$name" ] || return 1
   return 0
