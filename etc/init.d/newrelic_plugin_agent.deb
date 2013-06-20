@@ -92,7 +92,7 @@ if [ ! -f "${cfgfile}" ]; then
   exit 5
 fi
 
-pidfile=`sed -n -e 's/^[ 	]*pidfile[ 	]*=[ 	]*//p' -e 's/[ 	]*$//' "${cfgfile}" 2> /dev/null`
+pidfile=`sed -n -e 's/^[ 	]*pidfile[ 	]*:[ 	]*//p' -e 's/[ 	]*$//' "${cfgfile}" 2> /dev/null`
 
 pidarg=
 if [ -z "${pidfile}" ]; then
