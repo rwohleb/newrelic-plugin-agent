@@ -4,46 +4,42 @@ ApacheHTTPD Support
 """
 import logging
 import re
-import requests
-import time
 
 from newrelic_plugin_agent.plugins import base
 
 LOGGER = logging.getLogger(__name__)
 
-PATTERN = re.compile(r'Total Accesses\:\s(?P<accesses>\d+)\nTotal\skBytes\:'
-                     r'\s(?P<bytes>\d+)\nCPULoad\:\s(?P<cpuload>[\.\de\-]+)\s'
-                     r'Uptime\:\s(?P<uptime>\d+)\sReqPerSec\:\s'
-                     r'(?P<requests_per_sec>[\d\.]+)\nBytesPerSec\:\s'
-                     r'(?P<bytes_per_sec>[\d\.]+)\nBytesPerReq\:\s'
-                     r'(?P<bytes_per_request>[\d\.]+)\nBusyWorkers\:\s'
-                     r'(?P<busy>[\d\.]+)\nIdleWorkers\:\s(?P<idle>[\d\.]+)\n')
+PATTERN = re.compile(r'^([\w\s{1}]+):\s([\d\.{1}]+)', re.M)
 
-class ApacheHTTPD(base.Plugin):
 
+class ApacheHTTPD(base.HTTPStatsPlugin):
+
+    DEFAULT_QUERY = 'auto'
     GUID = 'com.meetme.newrelic_apache_httpd_agent'
+    KEYS = {'Total Accesses': {'type': '',
+                               'label': 'Totals/Requests'},
+            'BusyWorkers': {'type': 'gauge',
+                            'label': 'Workers/Busy'},
+            'Total kBytes': {'type': '',
+                             'label': 'Totals/Bytes Sent',
+                             'suffix': 'kb'},
+            'BytesPerSec': {'type': 'gauge',
+                            'label': 'Bytes/Per Second',
+                            'suffix': 'bytes/sec'},
+            'BytesPerReq': {'type': 'gauge',
+                            'label': 'Requests/Average Payload Size',
+                            'suffix': 'bytes'},
+            'IdleWorkers': {'type': 'gauge', 'label': 'Workers/Idle'},
+            'CPULoad': {'type': 'gauge', 'label': 'CPU Load'},
+            'ReqPerSec': {'type': 'gauge', 'label': 'Requests/Velocity',
+                                 'suffix': 'bytes/sec'},
+            'Uptime': {'type': 'gauge', 'label': 'Uptime', 'suffix': 'sec'}}
 
-    GAUGES = ['busy', 'idle', 'bytes_per_request', 'bytes_per_sec',
-              'uptime', 'cpuload', 'requests_per_sec']
-    KEYS = {'accesses': 'Totals/Requests',
-            'busy': 'Workers/Busy',
-            'bytes': 'Totals/Bytes Sent',
-            'bytes_per_sec': 'Bytes/Per Second',
-            'bytes_per_request': 'Requests/Average Payload Size',
-            'idle': 'Workers/Idle',
-            'cpuload': 'CPU Load',
-            'requests_per_sec': 'Requests/Velocity',
-            'uptime': 'Uptime'}
-
-    TYPES = {'bytes_per_sec': 'bytes/sec',
-             'bytes_per_request': 'bytes',
-             'bytes': 'kb',
-             'uptime': 'sec',
-             'busy': '',
-             'idle': '',
-             'cpuload': '',
-             'requests_per_sec': 'requests/sec',
-             'accesses': ''}
+    def error_message(self):
+            LOGGER.error('Could not match any of the stats, please make ensure '
+                         'Apache HTTPd is configured correctly. If you report '
+                         'this as a bug, please include the full output of the '
+                         'status page from %s in your ticket', self.stats_url)
 
     def add_datapoints(self, stats):
         """Add all of the data points for a node
@@ -51,55 +47,26 @@ class ApacheHTTPD(base.Plugin):
         :param str stats: The stats content from Apache as a string
 
         """
-        matches = PATTERN.match(stats)
-        if matches:
-            for key in self.KEYS.keys():
+        matches = PATTERN.findall(stats or '')
+        for key, value in matches:
+
+            try:
+                value = int(value)
+            except ValueError:
                 try:
-                    value = int(matches.group(key))
-                except (IndexError, ValueError):
-                    try:
-                        value = float(matches.group(key))
-                    except (IndexError, ValueError):
-                        value = 0
-                if key in self.GAUGES:
-                    self.add_gauge_value(self.KEYS[key], self.TYPES[key],
+                    value = float(value)
+                except ValueError:
+                    value = 0
+
+            if key in self.KEYS:
+                if self.KEYS[key].get('type') == 'gauge':
+                    self.add_gauge_value(self.KEYS[key]['label'],
+                                         self.KEYS[key].get('suffix', ''),
                                          value)
                 else:
-                    self.add_derive_value(self.KEYS[key], self.TYPES[key],
+                    self.add_derive_value(self.KEYS[key]['label'],
+                                          self.KEYS[key].get('suffix', ''),
                                           value)
-
-    @property
-    def apache_stats_url(self):
-        return 'http://%(host)s:%(port)s/%(path)s?auto' % self.config
-
-    def fetch_data(self):
-        """Fetch the data from the ApacheHTTPD server
-
-        :rtype: str
-
-        """
-        try:
-            response = requests.get(self.apache_stats_url)
-        except requests.ConnectionError as error:
-            LOGGER.error('Error polling ApacheHTTPD: %s', error)
-            return {}
-
-        if response.status_code == 200:
-            try:
-                return response.content
-            except Exception as error:
-                LOGGER.error('JSON decoding error: %r', error)
-                return ''
-        LOGGER.error('Error response from %s (%s): %s', self.apache_stats_url,
-                     response.status_code, response.content)
-        return ''
-
-    def poll(self):
-        LOGGER.info('Polling ApacheHTTPD via %s', self.apache_stats_url)
-        start_time = time.time()
-        self.derive = dict()
-        self.gauge = dict()
-        self.rate = dict()
-        self.add_datapoints(self.fetch_data())
-        LOGGER.info('Polling complete in %.2f seconds',
-                    time.time() - start_time)
+            else:
+                LOGGER.warning('Found unmapped key/value pair: %s = %s',
+                               key, value)

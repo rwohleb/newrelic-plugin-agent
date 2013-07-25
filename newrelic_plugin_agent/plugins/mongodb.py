@@ -3,9 +3,9 @@ MongoDB Support
 
 """
 import datetime
+from pymongo import errors
 import logging
 import pymongo
-import time
 
 from newrelic_plugin_agent.plugins import base
 
@@ -51,14 +51,14 @@ class MongoDB(base.Plugin):
         self.add_derive_value('Asserts/Message', '', asserts.get('msg', 0))
         self.add_derive_value('Asserts/User', '', asserts.get('user', 0))
         self.add_derive_value('Asserts/Rollovers', '',
-                             asserts.get('rollovers', 0))
+                              asserts.get('rollovers', 0))
 
         flush = stats.get('backgroundFlushing', dict())
         self.add_derive_timing_value('Background Flushes',
                                      'ms',
-                                     flush.get('flushes'),
-                                     flush.get('total_ms'),
-                                     flush.get('last_ms'))
+                                     flush.get('flushes', 0),
+                                     flush.get('total_ms', 0),
+                                     flush.get('last_ms', 0))
         self.add_gauge_value('Seconds since last flush',
                              'sec',
                              (datetime.datetime.now() -
@@ -71,8 +71,8 @@ class MongoDB(base.Plugin):
         self.add_gauge_value('Connections/Current', '', conn.get('current', 0))
 
         cursors = stats.get('cursors', dict())
-        self.add_gauge_value('Cursors/Open', '', cursors.get('totalOpen'))
-        self.add_derive_value('Cursors/Timed Out', '', cursors.get('timedOut'))
+        self.add_gauge_value('Cursors/Open', '', cursors.get('totalOpen', 0))
+        self.add_derive_value('Cursors/Timed Out', '', cursors.get('timedOut', 0))
 
         dur = stats.get('dur', dict())
         self.add_gauge_value('Durability/Commits in Write Lock', '',
@@ -84,7 +84,7 @@ class MongoDB(base.Plugin):
         self.add_gauge_value('Durability/Journal MB Written', 'mb',
                              dur.get('journaledMB', 0))
         self.add_gauge_value('Durability/Data File MB Written', 'mb',
-                             dur.get('writeToDataFilesMB'), 0)
+                             dur.get('writeToDataFilesMB', 0))
 
         timems = dur.get('timeMs', dict())
         self.add_gauge_value('Durability/Timings/Duration Measured', 'ms',
@@ -137,7 +137,8 @@ class MongoDB(base.Plugin):
                              mem.get('virtual', 0))
 
         net = stats.get('network', dict())
-        self.add_derive_value('Network/Requests', '', net.get('numRequests'))
+        self.add_derive_value('Network/Requests', '',
+                              net.get('numRequests', 0))
         self.add_derive_value('Network/Transfer/In', 'bytes',
                               net.get('bytesIn', 0))
         self.add_derive_value('Network/Transfer/Out', 'bytes',
@@ -165,20 +166,56 @@ class MongoDB(base.Plugin):
         """Fetch the data from the MongoDB server and add the datapoints
 
         """
-        client = self.connect()
         databases = self.config.get('databases', list())
+        if isinstance(databases, list):
+            self.get_and_add_db_list(databases)
+        else:
+            self.get_and_add_db_with_auth(databases)
+
+    def get_and_add_db_list(self, databases):
+        """Handle the list of databases while supporting authentication for
+        the admin if needed
+
+        :param list databases: The database list
+
+        """
+        client = self.connect()
         for database in databases:
             db = client[database]
-            if database == databases[0]:
-                self.add_server_datapoints(db.command('serverStatus'))
-            self.add_datapoints(database, db.command('dbStats'))
+            try:
+                if database == databases[0]:
+                    if self.config.get('admin_username'):
+                        db.authenticate(self.config['admin_username'],
+                                        self.config.get('admin_password'))
+                    self.add_server_datapoints(db.command('serverStatus'))
+                self.add_datapoints(database, db.command('dbStats'))
+            except errors.OperationFailure as error:
+                LOGGER.critical('Could not fetch stats: %s', error)
+
+    def get_and_add_db_with_auth(self, databases):
+        """Handle the nested database structure with usernnames and password.
+
+        :param dict databases: The databases data structure
+
+        """
+        client = self.connect()
+        db_names = databases.keys()
+        for database in db_names:
+            db = client[database]
+            try:
+                if database == db_names[0]:
+                    if self.config.get('admin_username'):
+                        db.authenticate(self.config['admin_username'],
+                                        self.config.get('admin_password'))
+                    self.add_server_datapoints(db.command('serverStatus'))
+                if 'username' in databases[database]:
+                    db.authenticate(databases[database]['username'],
+                                    databases[database].get('password'))
+                self.add_datapoints(database, db.command('dbStats'))
+            except errors.OperationFailure as error:
+                LOGGER.critical('Could not fetch stats: %s', error)
 
     def poll(self):
-        LOGGER.info('Polling MongoDB at %(host)s:%(port)i', self.config)
-        start_time = time.time()
-        self.derive = dict()
-        self.gauge = dict()
-        self.rate = dict()
+        self.initialize()
         self.get_and_add_stats()
-        LOGGER.info('Polling complete in %.2f seconds',
-                    time.time() - start_time)
+        self.finish()

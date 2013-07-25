@@ -3,9 +3,12 @@ Multiple Plugin Agent for the New Relic Platform
 
 """
 import clihelper
+import importlib
 import json
 import logging
 import os
+from yaml import parser
+import platform
 import requests
 import socket
 import Queue as queue
@@ -13,6 +16,7 @@ import threading
 import time
 
 from newrelic_plugin_agent import __version__
+from newrelic_plugin_agent import plugins
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,7 +26,7 @@ class NewRelicPluginAgent(clihelper.Controller):
     every minute and reports the state to NewRelic.
 
     """
-    IGNORE_KEYS = ['license_key', 'poll_interval']
+    IGNORE_KEYS = ['license_key', 'poll_interval', 'proxy', 'endpoint']
     MAX_METRICS_PER_REQUEST = 10000
     PLATFORM_URL = 'https://platform-api.newrelic.com/platform/v1/metrics'
 
@@ -40,11 +44,21 @@ class NewRelicPluginAgent(clihelper.Controller):
         self.threads = list()
         self._wake_interval = self.application_config.get('poll_interval',
                                                           self.WAKE_INTERVAL)
+        self.endpoint = self.application_config.get('endpoint',
+                                                    self.PLATFORM_URL)
         self.http_headers = {'Accept': 'application/json',
                              'Content-Type': 'application/json',
                              'X-License-Key': self.license_key}
         self.derive_last_interval = dict()
         self.min_max_values = dict()
+        distro = ' '.join(platform.linux_distribution()).strip()
+        os = platform.platform(True, True)
+        if distro:
+            os += ' (%s)' % distro
+        LOGGER.debug('Agent v%s initialized, %s %s on %s',
+                     __version__,
+                     platform.python_implementation(),
+                     platform.python_version(), os)
 
     @property
     def agent_data(self):
@@ -74,13 +88,17 @@ class NewRelicPluginAgent(clihelper.Controller):
 
         """
 
-        thread = threading.Thread(target=self.thread_process,
-                                  kwargs={'config': config,
-                                          'name': plugin_name,
-                                          'plugin': plugin,
-                                          'poll_interval': self._wake_interval})
-        thread.run()
-        self.threads.append(thread)
+        if not isinstance(config, (list, tuple)):
+            config = [config]
+
+        for instance in config:
+            thread = threading.Thread(target=self.thread_process,
+                                      kwargs={'config': instance,
+                                              'name': plugin_name,
+                                              'plugin': plugin,
+                                              'poll_interval': self._wake_interval})
+            thread.run()
+            self.threads.append(thread)
 
     def process(self):
         """This method is called after every sleep interval. If the intention
@@ -88,7 +106,6 @@ class NewRelicPluginAgent(clihelper.Controller):
         the run method.
 
         """
-        LOGGER.info('Polling')
         start_time = time.time()
         self.start_plugin_polling()
         while self.threads_running:
@@ -138,6 +155,20 @@ class NewRelicPluginAgent(clihelper.Controller):
 
             self.min_max_values[guid][name][metric] = min_val, max_val
 
+    @property
+    def proxies(self):
+        """Return the proxy used to access NewRelic.
+
+        :rtype: dict
+
+        """
+        if 'proxy' in self.application_config:
+            return {
+                'http': self.application_config['proxy'],
+                'https': self.application_config['proxy']
+            }
+        return None
+
     def send_data_to_newrelic(self):
         metrics = 0
         components = list()
@@ -171,13 +202,20 @@ class NewRelicPluginAgent(clihelper.Controller):
         JSON encoded POST body.
 
         """
+        if not metrics:
+            LOGGER.warning('No metrics to send to NewRelic this interval')
+            return
+
         LOGGER.info('Sending %i metrics to NewRelic', metrics)
         body = {'agent': self.agent_data, 'components': components}
         LOGGER.debug(body)
         try:
-            response = requests.post(self.PLATFORM_URL,
+            response = requests.post(self.endpoint,
                                      headers=self.http_headers,
-                                     data=json.dumps(body, ensure_ascii=False))
+                                     proxies=self.proxies,
+                                     data=json.dumps(body, ensure_ascii=False),
+                                     verify=self.config.get('verify_ssl_cert',
+                                                            True))
             LOGGER.debug('Response: %s: %r',
                          response.status_code,
                          response.content.strip())
@@ -188,77 +226,19 @@ class NewRelicPluginAgent(clihelper.Controller):
         self.last_interval_start = time.time()
 
     def start_plugin_polling(self):
-
-        plugins = [key for key in self.application_config.keys()
-                   if key not in self.IGNORE_KEYS]
-
-        for plugin in plugins:
-
-            if plugin == 'apache_httpd':
-                if 'apache_httpd' not in globals():
-                    from newrelic_plugin_agent.plugins import apache_httpd
-                self.poll_plugin(plugin, apache_httpd.ApacheHTTPD,
+        enabled_plugins = [key for key in self.application_config.keys()
+                           if key not in self.IGNORE_KEYS]
+        for plugin in enabled_plugins:
+            if plugin in plugins.available:
+                plugin_parts = plugins.available[plugin].split('.')
+                package = '.'.join(plugin_parts[:-1])
+                LOGGER.debug('Attempting to import %s', package)
+                module_handle = importlib.import_module(package)
+                class_handle = getattr(module_handle, plugin_parts[-1])
+                self.poll_plugin(plugin, class_handle,
                                  self.application_config.get(plugin))
-
-            if plugin == 'couchdb':
-                if 'couchdb' not in globals():
-                    from newrelic_plugin_agent.plugins import couchdb
-                self.poll_plugin(plugin, couchdb.CouchDB,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'edgecast':
-                if 'edgecast' not in globals():
-                    from newrelic_plugin_agent.plugins import edgecast
-                self.poll_plugin(plugin, edgecast.Edgecast,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'memcached':
-                if 'memcached' not in globals():
-                    from newrelic_plugin_agent.plugins import memcached
-                self.poll_plugin(plugin, memcached.Memcached,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'mongodb':
-                if 'mongodb' not in globals():
-                    from newrelic_plugin_agent.plugins import mongodb
-                self.poll_plugin(plugin, mongodb.MongoDB,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'nginx':
-                if 'nginx' not in globals():
-                    from newrelic_plugin_agent.plugins import nginx
-                self.poll_plugin(plugin, nginx.Nginx,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'pgbouncer':
-                if 'pgbouncer' not in globals():
-                    from newrelic_plugin_agent.plugins import pgbouncer
-                self.poll_plugin(plugin, pgbouncer.PgBouncer,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'postgresql':
-                if 'postgresql' not in globals():
-                    from newrelic_plugin_agent.plugins import postgresql
-                self.poll_plugin(plugin, postgresql.PostgreSQL,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'rabbitmq':
-                if 'rabbitmq' not in globals():
-                    from newrelic_plugin_agent.plugins import rabbitmq
-                self.poll_plugin(plugin, rabbitmq.RabbitMQ,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'redis':
-                if 'redis' not in globals():
-                    from newrelic_plugin_agent.plugins import redis
-                self.poll_plugin(plugin, redis.Redis,
-                                 self.application_config.get(plugin))
-
-            elif plugin == 'riak':
-                if 'riak' not in globals():
-                    from newrelic_plugin_agent.plugins import riak
-                self.poll_plugin(plugin, riak.Riak,
-                                 self.application_config.get(plugin))
+            else:
+                LOGGER.error('Enabled plugin %s not available', plugin)
 
     @property
     def threads_running(self):
@@ -268,11 +248,12 @@ class NewRelicPluginAgent(clihelper.Controller):
         return False
 
     def thread_process(self, name, plugin, config, poll_interval):
-        LOGGER.debug('Polling %s, %r, %r, %r',
-                     name, plugin, config, poll_interval)
-        obj = plugin(config, poll_interval, self.derive_last_interval.get(name))
+        instance_name = "%s:%s" % (name, config.get('name', 'unnamed'))
+        obj = plugin(config, poll_interval,
+                     self.derive_last_interval.get(instance_name))
         obj.poll()
-        self.publish_queue.put((name, obj.values(), obj.derive_last_interval))
+        self.publish_queue.put((instance_name, obj.values(),
+                                obj.derive_last_interval))
 
     @property
     def wake_interval(self):
@@ -289,8 +270,11 @@ def main():
     clihelper.setup('newrelic_plugin_agent',
                     'New Relic Platform Plugin Agent',
                     __version__)
-    clihelper.run(NewRelicPluginAgent)
-
+    try:
+        clihelper.run(NewRelicPluginAgent)
+    except parser.ParserError as error:
+        logging.basicConfig(level=logging.CRITICAL)
+        LOGGER.critical('Parsing of configuration file failed: %s', error)
 
 if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG)
